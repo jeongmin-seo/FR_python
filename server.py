@@ -22,6 +22,8 @@ Gst.init(None)
 connected_clients = {}  # cam_id: websocket
 frame_queues = {}       # cam_id: queue.Queue()
 main_event_loop = None  # asyncio 메인 루프
+# rotation_info = {}
+camera_info = {}
 
 class RTSPStream:
     def __init__(self, rtsp_url, cam_id):
@@ -95,6 +97,79 @@ class RTSPStream:
             self.loop.quit()
         print(f"[{self.cam_id}] RTSP 수신 종료")
 
+def identity(frame):
+    return frame
+
+def back_rotate_0_img(frame):
+    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    frame = cv2.resize(frame, (480, 640))
+
+    return frame
+
+def back_rotate_90_img(frame):
+    frame = cv2.rotate(frame, cv2.ROTATE_180)
+    frame = cv2.resize(frame, (640, 480))
+    return frame
+
+def back_rotate_180_img(frame):
+    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    frame = cv2.resize(frame, (480, 640))
+    return frame
+
+def back_rotate_270_img(frame):
+    frame = identity(frame)
+    frame = cv2.resize(frame, (640, 480))
+    return frame
+
+preprocess = {
+    # "front":{
+
+    # },
+    "back":{
+        "0": back_rotate_0_img,
+        "90": back_rotate_90_img,
+        "180": back_rotate_180_img,
+        "270": back_rotate_270_img
+    }    
+}
+
+
+def back_rotate_0_coord(coord, height, width):
+    return coord
+
+def back_rotate_270_coord(coord, height, width):
+    # coord[:, [1,3]] = height - coord[:, [1,3]]
+    # coord = coord[:, [3, 0, 1, 2]]
+    coord[[1,3]] = height - coord[[1,3]]
+    coord = coord[[3,0,1,2]]
+    return coord
+
+def back_rotate_180_coord(coord, height, width):
+    coord[[0,2]] = width - coord[[0,2]]
+    coord[[1,3]] = height - coord[[1,3]]
+    coord = coord[[2,1,0,3]]
+    return coord
+
+def back_rotate_90_coord(coord, height, width):
+    # coord[:,[0,2]] = width - coord[:,[0,2]]
+    # coord = coord[:, [1,2,3,0]]
+    coord[[0,2]] = width - coord[[0,2]]
+    coord = coord[[1,2,3,0]]
+    return coord
+
+coord_transform = {
+    # "front":{
+
+    # },
+    "back":{
+        "0": back_rotate_0_coord,
+        "90": back_rotate_90_coord,
+        "180": back_rotate_180_coord,
+        "270": back_rotate_270_coord
+    }    
+}
+
+
 
 
 def inference_worker(cam_id):
@@ -115,11 +190,18 @@ def inference_worker(cam_id):
             continue
 
         print(f"[{cam_id}] 추론 프레임 처리 중")
-
-        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        frame = frame[:,75:-75]
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = frame[75:-75, :]
-        frame = cv2.resize(frame, (480, 640))
+        # rotate = rotation_info.get(cam_id, 0)
+        # if rotate ==0:
+        #     frame = back_rotate_0(frame)
+
+        cur_cam_info = camera_info[cam_id]
+        rotation = cur_cam_info['rotation']
+        position = cur_cam_info['position']
+
+        preprocess_method = preprocess[position][rotation]
+        frame = preprocess_method(frame)
 
         height, width, _ = frame.shape
         frame = cv2.resize(frame, (640, 640))
@@ -158,6 +240,8 @@ def inference_worker(cam_id):
                 person_id = str(person['entity']['id'])
 
                 rescale_box = (box[:4] * scale).astype(np.int32)
+                coord_trans_method = coord_transform[position][rotation]
+                rescale_box = coord_trans_method(rescale_box, height, width)
 
                 # cv2.rectangle(frame, (int(rescale_box[0]), int(rescale_box[1])), (int(rescale_box[2]), int(rescale_box[3])), (0, 255, 0), 2)
                 # cv2.imwrite("0.jpg", frame)
@@ -196,6 +280,7 @@ async def websocket_handler(websocket):
 
     connected_clients[cam_id] = websocket
     frame_queues[cam_id] = queue.Queue(maxsize=10)
+    camera_info[cam_id] = {}
 
     rtsp_url = cam_id  # cam_id에 실제 URL이 들어왔다고 가정
 
@@ -205,12 +290,35 @@ async def websocket_handler(websocket):
 
     try:
         while True:
-            await asyncio.sleep(1)
+            # await asyncio.sleep(1)
+            message = await websocket.recv()
+            if message.startswith("rotation:"):
+                try:
+                    rotation = int(message.split(":")[1])
+                    if rotation in [0, 90, 180, 270]:
+                        # rotation_info[cam_id] = rotation
+                        camera_info[cam_id]['rotation'] = str(rotation)
+                        print(f"[{cam_id}] 회전 정보 수신: {rotation}도")
+                except ValueError:
+                    print(f"[{cam_id}] 회전 정보 파싱 실패: {message}")
+
+            elif message.startswith("cam_idx"):
+                try:
+                    position = message.split(":")[1]
+                    camera_info[cam_id]['position'] = position
+                    print(f"[{cam_id}] 전면 후면 여부 정보 수신: {position}")
+                except ValueError:
+                    print(f"[{cam_id}] 전면 후면 정보 파싱 실패: {message}")
+            else:
+                print(f"[{cam_id}] 기타 메시지 수신: {message}")
+
     except websockets.ConnectionClosed:
         print(f"[WebSocket] {cam_id} 연결 종료")
     finally:
         connected_clients.pop(cam_id, None)
         frame_queues.pop(cam_id, None)
+        # rotation_info.pop(cam_id, None)
+        camera_info.pop(cam_id, None)
 
 
 async def main():
