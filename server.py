@@ -21,9 +21,31 @@ Gst.init(None)
 
 connected_clients = {}  # cam_id: websocket
 frame_queues = {}       # cam_id: queue.Queue()
+stop_flags = {}
 main_event_loop = None  # asyncio 메인 루프
 # rotation_info = {}
 camera_info = {}
+
+END_OF_FRAME = object()
+
+client = MilvusClient("./milvus_demo.db")
+client.load_collection(collection_name="demo_collection")
+
+
+# ===== 글로벌 모델 =====
+det_model = None
+rec_model = None
+
+def load_models():
+    global det_model, rec_model
+    print("[Server] 모델 로딩 중...")
+    det_model = insightface.model_zoo.retinaface.RetinaFace("./buffalo_l/det_10g.onnx")
+    rec_model = insightface.model_zoo.arcface_onnx.ArcFaceONNX("./buffalo_l/w600k_r50.onnx")
+
+    det_model.session.set_providers(["CUDAExecutionProvider"])
+    rec_model.session.set_providers(["CUDAExecutionProvider"])
+    print("[Server] 모델 로딩 완료")
+
 
 class RTSPStream:
     def __init__(self, rtsp_url, cam_id):
@@ -63,9 +85,20 @@ class RTSPStream:
         frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3))
         buf.unmap(map_info)
 
-        if self.cam_id in frame_queues and not frame_queues[self.cam_id].full():
+        # if self.cam_id in frame_queues and not frame_queues[self.cam_id].full():
+        #     timestamp_ms = int(time.time() * 1000)
+        #     frame_queues[self.cam_id].put([frame, timestamp_ms])
+        if self.cam_id in frame_queues:
             timestamp_ms = int(time.time() * 1000)
-            frame_queues[self.cam_id].put([frame, timestamp_ms])
+            item = [frame, timestamp_ms]
+            try:
+                frame_queues[self.cam_id].put_nowait(item)
+            except queue.Full:
+                try:
+                    _ = frame_queues[self.cam_id].get_nowait()  # 가장 오래된 항목 제거
+                except queue.Empty:
+                    pass
+                frame_queues[self.cam_id].put_nowait(item)
 
         return Gst.FlowReturn.OK
 
@@ -76,9 +109,15 @@ class RTSPStream:
             print(f"[{self.cam_id}] GStreamer Error: {err}")
             self.pipeline.set_state(Gst.State.NULL)
             self.loop.quit()
+            self.running = True
+
+        elif t == Gst.MessageType.EOS:
+            self.stop()
+            self.running = False
 
     def start(self):
-        while True:
+        # while True:
+        while self.running:
             try:
                 print(f"[{self.cam_id}] RTSP 스트림 연결 시도 중... {self.rtsp_url}")
                 self.build_pipeline()
@@ -87,15 +126,46 @@ class RTSPStream:
                 print(f"[{self.cam_id}] 스트리밍 루프 종료됨")
             except Exception as e:
                 print(f"[{self.cam_id}] RTSP 연결 예외 발생: {e}")
+
+            if not self.running:
+                break
+
             print(f"[{self.cam_id}] 3초 후 재시도...")
             time.sleep(3)
 
     def stop(self):
+        """
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
         if self.loop:
             self.loop.quit()
+        """
+        #  pipeline 종료
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+        
+        # appsink disconnect
+        if self.appsink:
+            try:
+                self.appsink.disconnect_by_func(self.on_new_sample)
+            except Exception:
+                pass
+            self.appsink = None
+
+        # bus signal watch 제거
+        if self.bus:
+            self.bus.remove_signal_watch()
+            self.bus = None
+
+        # GLib loop 종료
+        if self.loop and self.loop.is_running():
+            self.loop.quit()
+            self.loop = None
+
+        # pipeline 해제
+        self.pipeline = None
         print(f"[{self.cam_id}] RTSP 수신 종료")
+
 
 def identity(frame):
     return frame
@@ -174,18 +244,21 @@ coord_transform = {
 
 def inference_worker(cam_id):
     print(f"[{cam_id}] 추론 쓰레드 시작")
+    stop_event = stop_flags[cam_id]
 
-    det = insightface.model_zoo.retinaface.RetinaFace("./buffalo_l/det_10g.onnx")
-    rec = insightface.model_zoo.arcface_onnx.ArcFaceONNX("./buffalo_l/w600k_r50.onnx")
-    det.session.set_providers(["CUDAExecutionProvider"])
-    rec.session.set_providers(["CUDAExecutionProvider"])
+    global det_model, rec_model
+    det = det_model
+    rec = rec_model
 
-    client = MilvusClient("./milvus_demo.db")
-    client.load_collection(collection_name="demo_collection")
-
-    while True:
+    # while True:
+    # while cam_id in frame_queues:
+    while not stop_event.is_set():
         try:
-            frame, frame_id = frame_queues[cam_id].get(timeout=5)
+            item = frame_queues[cam_id].get(timeout=5)
+
+            if item is END_OF_FRAME:
+                break
+            frame, frame_id = item
         except queue.Empty:
             continue
 
@@ -266,6 +339,20 @@ def inference_worker(cam_id):
                 print(f"[{cam_id}] WebSocket 전송 오류: {e}")
                 connected_clients.pop(cam_id, None)
 
+    frame = None
+    bat = None
+    boxes = None
+    kpss = None
+    embedding = None
+    result = None
+    align_img = None
+    rescale_box = None
+
+    det = None
+    rec = None
+
+
+
 
 async def send_result(ws, result):
     try:
@@ -280,13 +367,17 @@ async def websocket_handler(websocket):
 
     connected_clients[cam_id] = websocket
     frame_queues[cam_id] = queue.Queue(maxsize=10)
+    stop_flags[cam_id] = threading.Event()
     camera_info[cam_id] = {}
 
     rtsp_url = cam_id  # cam_id에 실제 URL이 들어왔다고 가정
 
     # RTSP 및 추론 쓰레드 시작
-    threading.Thread(target=RTSPStream(rtsp_url, cam_id).start, daemon=True).start()
-    threading.Thread(target=inference_worker, args=(cam_id,), daemon=True).start()
+    stream = RTSPStream(rtsp_url, cam_id)
+    stream_thread = threading.Thread(target=stream.start, daemon=True)
+    infer_thread = threading.Thread(target=inference_worker, args=(cam_id,), daemon=True)
+    stream_thread.start()
+    infer_thread.start()
 
     try:
         while True:
@@ -315,10 +406,30 @@ async def websocket_handler(websocket):
     except websockets.ConnectionClosed:
         print(f"[WebSocket] {cam_id} 연결 종료")
     finally:
+        print(f"[{cam_id}] 리소스 정리 중...")
+        stop_flags[cam_id].set()                  # 종료 플래그 설정
+        frame_queues[cam_id].put(END_OF_FRAME)        # get() 블로킹 해제
+        infer_thread.join()
+
+        # 큐 비우고 남은 프레임 삭제
+        while not frame_queues[cam_id].empty():
+            item = frame_queues[cam_id].get_nowait()
+            if item is not END_OF_FRAME:
+                frame, _ = item
+                del frame  # 참조 제거
+
+        stream.stop()       
+        stream.running = False
+        stream_thread.join()
+
+
         connected_clients.pop(cam_id, None)
         frame_queues.pop(cam_id, None)
-        # rotation_info.pop(cam_id, None)
+        stop_flags.pop(cam_id, None)
         camera_info.pop(cam_id, None)
+
+
+        print(f"[{cam_id}] 정리 완료")
 
 
 async def main():
@@ -330,4 +441,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    load_models()
     asyncio.run(main())
