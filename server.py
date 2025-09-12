@@ -2,6 +2,7 @@
 import asyncio
 import websockets
 import threading
+import requests
 import queue
 import gi
 import cv2
@@ -28,6 +29,7 @@ camera_info = {}
 
 END_OF_FRAME = object()
 
+API_URL = "http://localhost:8000/attendance"
 client = MilvusClient("./milvus_demo.db")
 client.load_collection(collection_name="demo_collection")
 
@@ -240,6 +242,16 @@ coord_transform = {
 }
 
 
+def save_attendance(student_id, student_name, cam_id):
+    try:
+        res = requests.post(API_URL, json={
+            "student_id": student_id,
+            "student_name": student_name,
+            "cam_id": cam_id
+        })
+        print("[Attendance] 저장 성공:", res.json())
+    except Exception as e:
+        print("[Attendance] 저장 실패:", e)
 
 
 def inference_worker(cam_id):
@@ -307,10 +319,12 @@ def inference_worker(cam_id):
                 distance = person['distance']
 
                 if distance < 0.2:
-                    continue
-
-                name = person['entity']['name']
-                person_id = str(person['entity']['id'])
+                    name = "Unknown"
+                    person_id = "-1"
+                else:
+                    name = person['entity']['name']
+                    person_id = str(person['entity']['id'])
+                    save_attendance(person_id, name, cam_id)
 
                 rescale_box = (box[:4] * scale).astype(np.int32)
                 coord_trans_method = coord_transform[position][rotation]
