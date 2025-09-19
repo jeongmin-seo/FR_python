@@ -78,11 +78,15 @@ class VideoApp(QWidget):
 
         file_path, _  = QFileDialog.getOpenFileName(self, "이미지 선택", "", "Image Files (*.png *.jpg *.jpeg)")
 
-        if file_path:
-            image = cv2.imread(file_path)
-            if image is None:
-                print("이미지 불러얼 수 없습니다.")
-                return  # raise Error 로 수정
+        if not file_path:  # upload 에서 취소 누른 경우
+            print("파일 선택 취소")
+            self.is_webcam = True
+            return
+
+        image = cv2.imread(file_path)
+        if image is None:
+            print("이미지 불러올 수 없습니다.")
+            return  
 
         self.face_detect(image)
 
@@ -99,13 +103,13 @@ class VideoApp(QWidget):
             self.kps = kpss[0]
             cv2.rectangle(rgb_image, (int(r[0]), int(r[1])), (int(r[2]), int(r[3])), (0, 255, 0), 2)
             self.align_img = face_align.norm_crop(rgb_image, landmark=kpss[0], image_size=112)
-
-            h, w, ch = rgb_image.shape
-            img = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
-            self.image_label.setPixmap(QPixmap.fromImage(img))
+            
         else:
             print("FAILED DETECT FACE")
 
+        h, w, ch = rgb_image.shape
+        img = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
+        self.image_label.setPixmap(QPixmap.fromImage(img))
 
     def on_submit(self):
         face_id = self.input_id_field.text()
