@@ -2,7 +2,7 @@
 
 # mediaMTX 실행
 /home/jmseo/download/mediamtx /home/jmseo/download/mediamtx.yml &
-PID3=$!
+PID1=$!
 
 # server.py 실행 (envA)
 source /home/jmseo/anaconda3/etc/profile.d/conda.sh
